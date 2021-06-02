@@ -14,6 +14,7 @@
 
 import logging
 import threading
+import weakref
 from typing import (
     Collection,
     Container,
@@ -173,6 +174,8 @@ class EventsWorkerStore(SQLBaseStore):
         # Map from event ID to a deferred tat will result in an
         # Optional[_EventCacheEntry].
         self._current_event_fetches: Dict[str, ObservableDeferred] = {}
+
+        self._event_ref: Dict[str, EventBase] = weakref.WeakValueDictionary()
 
         self._event_fetch_lock = threading.Condition()
         self._event_fetch_list = []
@@ -522,7 +525,9 @@ class EventsWorkerStore(SQLBaseStore):
                 already_fetching[event_id] = deferred.observe()
             else:
                 self._current_event_fetches[event_id] = fetching_deferred
-                fetching_deferred.observe().addBoth(lambda _: self._current_event_fetches.pop(event_id, None))
+                fetching_deferred.observe().addBoth(
+                    lambda _: self._current_event_fetches.pop(event_id, None)
+                )
 
         missing_events_ids.difference_update(already_fetching)
 
@@ -569,6 +574,8 @@ class EventsWorkerStore(SQLBaseStore):
 
     def _invalidate_get_event_cache(self, event_id):
         self._get_event_cache.invalidate((event_id,))
+        self._event_ref.pop(event_id, None)
+        self._current_event_fetches.pop(event_id, None)
 
     def _get_events_from_cache(
         self, events: Iterable[str], update_metrics: bool = True
@@ -585,10 +592,22 @@ class EventsWorkerStore(SQLBaseStore):
             ret = self._get_event_cache.get(
                 (event_id,), None, update_metrics=update_metrics
             )
-            if not ret:
-                continue
+            if ret:
+                event_map[event_id] = ret
 
-            event_map[event_id] = ret
+            event = self._event_ref.get(event_id)
+            if event:
+                redacted_event = None
+                if event.internal_metadata.redacted_by:
+                    redacted_event = prune_event(event)
+                    redacted_event.unsigned[
+                        "redacted_by"
+                    ] = event.internal_metadata.redacted_by
+
+                event_map[event_id] = _EventCacheEntry(
+                    event=event,
+                    redacted_event=redacted_event,
+                )
 
         return event_map
 
@@ -858,12 +877,19 @@ class EventsWorkerStore(SQLBaseStore):
                 original_ev, redactions, event_map
             )
 
+            if redacted_event:
+                original_ev.internal_metadata.redacted_by = redacted_event.unsigned[
+                    "redacted_by"
+                ]
+
             cache_entry = _EventCacheEntry(
                 event=original_ev, redacted_event=redacted_event
             )
 
             self._get_event_cache.set((event_id,), cache_entry)
             result_map[event_id] = cache_entry
+
+            self._event_ref[event_id] = original_ev
 
         return result_map
 
