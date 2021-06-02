@@ -35,7 +35,6 @@ from typing import (
 
 import attr
 from prometheus_client import Counter
-from synapse.util.async_helpers import concurrently_execute
 
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import (
@@ -57,9 +56,8 @@ from synapse.federation.federation_base import FederationBase, event_from_pdu_js
 from synapse.federation.transport.client import SendJoinResponse
 from synapse.logging.utils import log_function
 from synapse.types import JsonDict, get_domain_from_id
-from synapse.util.async_helpers import yieldable_gather_results
+from synapse.util.async_helpers import concurrently_execute, yieldable_gather_results
 from synapse.util.caches.expiringcache import ExpiringCache
-from synapse.util.iterutils import batch_iter
 from synapse.util.retryutils import NotRetryingDestination
 
 if TYPE_CHECKING:
@@ -705,17 +703,20 @@ class FederationClient(FederationBase):
 
             valid_pdus_map: Dict[str, EventBase] = {}
 
-            async def _execute(batch):
-                new_pdus = await self._check_sigs_and_hash_and_fetch(
-                    destination,
-                    batch,
+            async def _execute(pdu: EventBase) -> None:
+                valid_pdu = await self._check_sigs_and_hash_and_fetch_one(
+                    pdu=pdu,
+                    origin=destination,
                     outlier=True,
                     room_version=room_version,
                 )
 
-                valid_pdus_map.update((p.event_id, p) for p in new_pdus)
+                if valid_pdu:
+                    valid_pdus_map[valid_pdu.event_id] = valid_pdu
 
-            concurrently_execute(_execute, itertools.chain(state, auth_chain), 10000)
+            await concurrently_execute(
+                _execute, itertools.chain(state, auth_chain), 10000
+            )
 
             # NB: We *need* to copy to ensure that we don't have multiple
             # references being passed on, as that causes... issues.
