@@ -35,6 +35,7 @@ from typing import (
 
 import attr
 from prometheus_client import Counter
+from synapse.util.async_helpers import concurrently_execute
 
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import (
@@ -703,7 +704,8 @@ class FederationClient(FederationBase):
             )
 
             valid_pdus_map: Dict[str, EventBase] = {}
-            for batch in batch_iter(itertools.chain(state, auth_chain), 5000):
+
+            async def _execute(batch):
                 new_pdus = await self._check_sigs_and_hash_and_fetch(
                     destination,
                     batch,
@@ -712,6 +714,8 @@ class FederationClient(FederationBase):
                 )
 
                 valid_pdus_map.update((p.event_id, p) for p in new_pdus)
+
+            concurrently_execute(_execute, itertools.chain(state, auth_chain), 10000)
 
             # NB: We *need* to copy to ensure that we don't have multiple
             # references being passed on, as that causes... issues.
