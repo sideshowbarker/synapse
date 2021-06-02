@@ -42,7 +42,11 @@ from synapse.api.room_versions import (
 from synapse.events import EventBase, make_event_from_dict
 from synapse.events.snapshot import EventContext
 from synapse.events.utils import prune_event
-from synapse.logging.context import PreserveLoggingContext, current_context
+from synapse.logging.context import (
+    PreserveLoggingContext,
+    current_context,
+    make_deferred_yieldable,
+)
 from synapse.metrics.background_process_metrics import (
     run_as_background_process,
     wrap_as_background_process,
@@ -56,6 +60,8 @@ from synapse.storage.engines import PostgresEngine
 from synapse.storage.util.id_generators import MultiWriterIdGenerator, StreamIdGenerator
 from synapse.storage.util.sequence import build_sequence_generator
 from synapse.types import JsonDict, get_domain_from_id
+from synapse.util import unwrapFirstError
+from synapse.util.async_helpers import ObservableDeferred
 from synapse.util.caches.descriptors import cached, cachedList
 from synapse.util.caches.lrucache import LruCache
 from synapse.util.iterutils import batch_iter
@@ -163,6 +169,10 @@ class EventsWorkerStore(SQLBaseStore):
             cache_name="*getEvent*",
             max_size=hs.config.caches.event_cache_size,
         )
+
+        # Map from event ID to a deferred tat will result in an
+        # Optional[_EventCacheEntry].
+        self._current_event_fetches: Dict[str, ObservableDeferred] = {}
 
         self._event_fetch_lock = threading.Condition()
         self._event_fetch_list = []
@@ -502,7 +512,19 @@ class EventsWorkerStore(SQLBaseStore):
             event_ids,
         )
 
-        missing_events_ids = [e for e in event_ids if e not in event_entry_map]
+        missing_events_ids = {e for e in event_ids if e not in event_entry_map}
+        already_fetching = {}
+        fetching_deferred = ObservableDeferred(defer.Deferred())
+
+        for event_id in missing_events_ids:
+            deferred = self._current_event_fetches.get(event_id)
+            if deferred is not None:
+                already_fetching[event_id] = deferred.observe()
+            else:
+                self._current_event_fetches[event_id] = fetching_deferred
+                fetching_deferred.observe().addBoth(lambda _: self._current_event_fetches.pop(event_id, None))
+
+        missing_events_ids.difference_update(already_fetching)
 
         if missing_events_ids:
             log_ctx = current_context()
@@ -513,11 +535,28 @@ class EventsWorkerStore(SQLBaseStore):
             # the events have been redacted, and if so pulling the redaction event out
             # of the database to check it.
             #
-            missing_events = await self._get_events_from_db(
-                missing_events_ids,
-            )
+            try:
+                missing_events = await self._get_events_from_db(
+                    missing_events_ids,
+                )
 
-            event_entry_map.update(missing_events)
+                event_entry_map.update(missing_events)
+            except Exception as e:
+                fetching_deferred.errback(e)
+                raise e
+
+            fetching_deferred.callback(missing_events)
+
+        if already_fetching:
+            results = await make_deferred_yieldable(
+                defer.gatherResults(
+                    already_fetching.values(),
+                    consumeErrors=True,
+                )
+            ).addErrback(unwrapFirstError)
+
+            for result in results:
+                event_entry_map.update(result)
 
         if not allow_rejected:
             event_entry_map = {
