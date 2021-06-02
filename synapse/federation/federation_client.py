@@ -21,6 +21,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Collection,
     Dict,
     Iterable,
     List,
@@ -57,6 +58,7 @@ from synapse.logging.utils import log_function
 from synapse.types import JsonDict, get_domain_from_id
 from synapse.util.async_helpers import yieldable_gather_results
 from synapse.util.caches.expiringcache import ExpiringCache
+from synapse.util.iterutils import batch_iter
 from synapse.util.retryutils import NotRetryingDestination
 
 if TYPE_CHECKING:
@@ -356,7 +358,7 @@ class FederationClient(FederationBase):
     async def _check_sigs_and_hash_and_fetch(
         self,
         origin: str,
-        pdus: List[EventBase],
+        pdus: Collection[EventBase],
         room_version: RoomVersion,
         outlier: bool = False,
         include_none: bool = False,
@@ -673,8 +675,6 @@ class FederationClient(FederationBase):
             state = response.state
             auth_chain = response.auth_events
 
-            pdus = {p.event_id: p for p in itertools.chain(state, auth_chain)}
-
             create_event = None
             for e in state:
                 if (e.type, e.state_key) == (EventTypes.Create, ""):
@@ -698,14 +698,20 @@ class FederationClient(FederationBase):
                     % (create_room_version,)
                 )
 
-            valid_pdus = await self._check_sigs_and_hash_and_fetch(
-                destination,
-                list(pdus.values()),
-                outlier=True,
-                room_version=room_version,
+            logger.info(
+                "Processing from send_join %d events", len(state) + len(auth_chain)
             )
 
-            valid_pdus_map = {p.event_id: p for p in valid_pdus}
+            valid_pdus_map: Dict[str, EventBase] = {}
+            for batch in batch_iter(itertools.chain(state, auth_chain), 5000):
+                new_pdus = await self._check_sigs_and_hash_and_fetch(
+                    destination,
+                    batch,
+                    outlier=True,
+                    room_version=room_version,
+                )
+
+                valid_pdus_map.update((p.event_id, p) for p in new_pdus)
 
             # NB: We *need* to copy to ensure that we don't have multiple
             # references being passed on, as that causes... issues.
