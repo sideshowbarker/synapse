@@ -272,6 +272,20 @@ class Keyring:
             for server_name, event, validity_time in server_and_events
         ]
 
+    async def verify_event_for_server(
+        self,
+        server_name: str,
+        event: EventBase,
+        validity_time: int,
+    ) -> None:
+        await self.process_request(
+            VerifyJsonRequest.from_event(
+                server_name,
+                event,
+                validity_time,
+            )
+        )
+
     async def process_request(self, verify_request: VerifyJsonRequest) -> None:
         """Processes the `VerifyJsonRequest`. Raises if the object is not signed
         by the server, the signatures don't match or we failed to fetch the
